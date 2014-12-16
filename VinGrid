@@ -1,0 +1,280 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Collections.Specialized;
+using System.ComponentModel;
+using System.Linq;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Data;
+
+namespace DynamicColumnGrid
+{
+    public class VinGrid : DataGrid
+    {
+        #region Properties
+
+        public ObservableCollection<DynamicColumn> DynamicColumnList
+        {
+            get { return GetValue(DynamicColumnListProperty) as ObservableCollection<DynamicColumn>; }
+            set { SetValue(DynamicColumnListProperty, value); }
+        }
+
+        public static readonly DependencyProperty DynamicColumnListProperty
+            = DependencyProperty.Register(
+                "DynamicColumnList",
+                typeof(ObservableCollection<DynamicColumn>),
+                typeof(VinGrid),
+                new FrameworkPropertyMetadata(
+                    null,
+                    FrameworkPropertyMetadataOptions.BindsTwoWayByDefault,
+                    DynamicColumnListChangedCallback
+                )
+            );
+
+        #endregion Properties
+
+        #region Util
+
+        private static void DynamicColumnListChangedCallback(DependencyObject dependencyObject, DependencyPropertyChangedEventArgs e)
+        {
+            var grid
+                = dependencyObject as VinGrid;
+
+            if (e.OldValue != null)
+            {
+                grid.RemoveDynamicColumns(
+                    e.OldValue as ObservableCollection<DynamicColumn>
+                    );
+            }
+
+            var newDynamicColList
+                = e.NewValue as ObservableCollection<DynamicColumn>;
+
+            if (newDynamicColList != null)
+            {
+                grid.AddDynamicColumns(
+                    e.NewValue as ObservableCollection<DynamicColumn>
+                    );
+
+                newDynamicColList.CollectionChanged
+                    += grid.dynamicColListCollectionChanged;
+            }
+        }
+
+        private void dynamicColListCollectionChanged(object sender, NotifyCollectionChangedEventArgs e)
+        {
+            Action<IList, Action<IEnumerable<DynamicColumn>>> itemsOperation = (items, operation) =>
+            {
+                if (items != null)
+                {
+                    operation(
+                        from DynamicColumn colInfo
+                            in items
+                        select colInfo
+                        );
+                }
+            };
+
+            itemsOperation(
+                e.OldItems,
+                RemoveDynamicColumns
+                );
+
+            itemsOperation(
+                e.NewItems,
+                AddDynamicColumns
+                );
+        }
+
+        private void RemoveDynamicColumns(IEnumerable<DynamicColumn> colInfoList)
+        {
+            var sourcePropNameList = colInfoList
+                .Select(info => info.SourceProperty)
+                .ToList();
+
+            Func<DataGridColumn, bool> isTargetDynamicColumn = (col) =>
+            {
+                if (col is DataGridBoundColumn)
+                {
+                    var path = ((col as DataGridBoundColumn).Binding as Binding).Path.Path;
+
+                    return sourcePropNameList
+                        .Any(propName =>
+                            path.StartsWith(
+                                propName,
+                                StringComparison.InvariantCultureIgnoreCase
+                                )
+                            );
+                }
+
+                return false;
+            };
+
+            Columns
+                .Where(isTargetDynamicColumn)
+                .ToList()
+                .ForEach(
+                    col => Columns.Remove(col)
+                    );
+        }
+
+        private void AddDynamicColumns(IEnumerable<DynamicColumn> colInfoList)
+        {
+            if (colInfoList == null
+                || !colInfoList.Any()) return;
+
+            var colList
+                = new List<DataGridColumn>();
+
+            colInfoList
+                .Select((ColInfo, Index) => new { ColInfo, Index })
+                .ToList()
+                .ForEach(data =>
+                {
+                    var itemProperties
+                        = new DynamicMemberItemProperties(data.ColInfo.ItemType);
+
+                    var tempColList
+                        = GenerateColumns(itemProperties)
+                            .OfType<DataGridBoundColumn>();
+
+                    foreach (var boundCol in tempColList)
+                    {
+                        var existingBinding
+                            = boundCol.Binding as Binding;
+
+                        var colGenEventArg
+                            = new DataGridAutoGeneratingColumnEventArgs(
+                                existingBinding.Path.Path,
+                                itemProperties.GetPropertyType(
+                                    existingBinding.Path.Path
+                                    ),
+                                boundCol
+                                );
+
+                        var newBinding
+                            = new Binding(
+                                string.Format(
+                                    "{0}[{1}].{2}",
+                                    data.ColInfo.SourceProperty,
+                                    data.ColInfo.Key ?? data.Index.ToString(),
+                                    existingBinding.Path.Path
+                                    )
+                                );
+
+                        boundCol.Binding
+                            = newBinding;
+
+                        boundCol.ClipboardContentBinding
+                            = newBinding;
+
+                        OnAutoGeneratingColumn(
+                            colGenEventArg
+                            );
+
+                        if (!colGenEventArg.Cancel)
+                        {
+                            Columns.Add(boundCol);
+                        }
+                    }
+                });
+
+            OnAutoGeneratedColumns(
+                new EventArgs()
+                );
+        }
+
+        #endregion Util
+    }
+
+    public class DynamicMemberItemProperties : IItemProperties
+    {
+        #region Properties
+
+        public ReadOnlyCollection<ItemPropertyInfo> ItemProperties { get; private set; }
+
+        #endregion Properties
+
+        #region Construcstor
+
+        public DynamicMemberItemProperties(Type propType)
+        {
+            ItemProperties = new ReadOnlyCollection<ItemPropertyInfo>(
+                (from PropertyDescriptor propDesc in TypeDescriptor.GetProperties(propType) select propDesc)
+                .Select(func => new ItemPropertyInfo(func.Name, func.PropertyType, func))
+                .ToList());
+        }
+
+        #endregion Construcstor
+
+        #region Util
+
+        public Type GetPropertyType(string propName)
+        {
+            var typeQuery = ItemProperties
+                .Where(func => func.Name.Equals(propName));
+
+            return typeQuery.Any() ? typeQuery.First().PropertyType : null;
+        }
+
+        public object GetPropertyDesc(string propName)
+        {
+            var typeQuery = ItemProperties
+                .Where(func => func.Name.Equals(propName));
+
+            return typeQuery.Any() ? typeQuery.First().Descriptor : null;
+        }
+
+        #endregion Util
+    }
+
+    public class DynamicColumn
+    {
+        #region Properties
+
+        public readonly string SourceProperty;
+        public readonly string Key;
+        public readonly Type ItemType;
+
+        #endregion Properties
+
+        #region Constructor
+
+        public DynamicColumn(string srcProp, string key, Type itemType)
+        {
+            SourceProperty = srcProp;
+            Key = key;
+            ItemType = itemType;
+        }
+
+        #endregion Constructor
+    }
+
+    public class DynamicItem<K, V> : Dictionary<K, V>
+    {
+        public DynamicItem()
+        {
+        }
+
+        public new V this[K key]
+        {
+            get
+            {
+                return ContainsKey(key) ? base[key] : default(V);
+            }
+            set
+            {
+                if (ContainsKey(key))
+                {
+                    base[key] = value;
+                }
+                else
+                {
+                    Add(key, value);
+                }
+            }
+        }
+    }
+}
